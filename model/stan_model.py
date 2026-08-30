@@ -76,6 +76,7 @@ import torch.nn as nn
 import math
 from typing import Optional, Tuple
 from torch.nn import functional as F
+from .activation_fuctions import ACT2FN
 
 # 继承 nn.Module类
 class RMSNorm(nn.Module):
@@ -199,7 +200,7 @@ class Attention(nn.Module):
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
 
 
-    def forword(self, 
+    def forward(self, 
                 x : torch.Tensor, 
                 position_embedding : Tuple[torch.Tensor, torch.Tensor],
                 past_key_value : Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
@@ -262,3 +263,28 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_key_value
+
+
+class FeedForward(nn.Module):
+    # 初始化
+    # 升维
+    # 门控
+    # 激活函数
+    # 降维
+    # dropout
+    def __init__(self, args : StanMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8 / 3)
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias = False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias = False)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias = False)
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self, x): 
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+
+    
