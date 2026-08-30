@@ -73,6 +73,9 @@ class StanMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+import math
+from typing import Optional, Tuple
+from torch.nn import functional as F
 
 # 继承 nn.Module类
 class RMSNorm(nn.Module):
@@ -88,3 +91,174 @@ class RMSNorm(nn.Module):
 # forward 
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x)
+
+def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Optional[dict] = None):
+    # 初始化rope频率
+    freqs, attn_factor = 1 / (rope_base ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)), 1.0
+
+    if rope_scaling is not None:
+        orgin_max, factor, beta_fast, beta_slow = (
+            rope_scaling["original_max_position_embeddings"],
+            rope_scaling["factor"],
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"]
+        )
+
+    # 如果推断的长度 大于 训练长度，使用 YaRN 进行缩放
+    if end > orgin_max:
+        # 波长b到i的映射
+        inv_dim = lambda b : (dim * math.log(orgin_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+        # 划分高低维度
+        # low 不需要缩放的 高频部分
+        # high 需要缩放的 低频部分
+        low ,high = max(math.floor(inv_dim(beta_fast)), 0) , min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+
+        # 计算缩放因子
+        # low部分 ramp = 0, high部分 ramp = 1， low与high之间平滑过渡
+        ramp = torch.clamp(
+            (torch.arange(dim // 2, device=freqs.device).float() - low)
+            / max(high - low, 0.001),
+            0,
+            1,
+        )
+
+        # 频率融合公式：f'(i) = f(i) * ((1-γ) + γ/s)
+        # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
+        # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
+        # ramp在0-1之间时：平滑过渡。
+        freqs = freqs * (1 - ramp + ramp / factor)
+
+    #根据end，计算位置索引 t
+    t = torch.arange(end, device=freqs.device).float()
+
+    # 计算频率和位置的外积，得到每个位置的旋转角度
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+
+    return freqs_cos, freqs_sin
+
+# 编写RoPE的应用函数
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # [a, b] -> [-b, a]
+    def rotate_half(x):
+        return torch.cat(
+            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
+        )
+    #x_rotated=x*cos+rotate_ half(×)*sin   
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+    )
+    return q_embed, k_embed
+
+
+def repeat_kv(x : torch.Tensor, n_rep : int)-> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+
+    return (
+        x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self, args : StanMindConfig):
+        super().__init__()
+
+        # 得到KV 的 头数
+        if args.num_key_value_heads:
+            self.num_key_value_heads = args.num_key_value_heads
+        else:
+            self.num_key_value_heads = args.num_attention_heads  
+
+        # 确保Q 的头数 可以 整除 kv的头数
+        assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+
+        self.n_local_heads = args.num_attention_heads
+        self.num_key_value_heads = args.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.num_key_value_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        # 对线性层的 QKV进行一个定义
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias = False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias = False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias = False)
+
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias = False)
+
+        # 定义变量
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+
+        # 计算加速
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
+
+
+    def forword(self, 
+                x : torch.Tensor, 
+                position_embedding : Tuple[torch.Tensor, torch.Tensor],
+                past_key_value : Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+                use_cache = False, 
+                attention_mask : Optional[torch.Tensor] = None,
+                ) -> torch.Tensor:
+        # 投影，计算q k v 
+        bsz, seq_len, _ = x.shape
+        xq,xk,xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        # 用 view， 把输入拆分成多个头
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+
+        # q k 使用 rope
+        cos, sim = position_embedding
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sim[:seq_len])
+    
+        # k v 使用 repeat， kv cache
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim = 1)
+            xv = torch.cat([past_key_value[1], xv], dim = 1)
+        past_key_value = (xk, xv) if use_cache else None
+
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            # [bsz, self.n_local_heads, seq_len, self.head_dim]
+            repeat_kv(xk, self.n_rep).transpose(1, 2), 
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+
+        # 注意力公式计算
+        # pytorch内置实现
+        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1).bool()
+            )
+            output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask = attn_mask, 
+                                                    dropout_p = self.dropout if self.training else 0.0, is_causal = True)
+        else:
+            # 自定义实现
+            scores = (xq@xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores + torch.triu(
+                torch.full((seq_len,seq_len), float('-inf'), device = scores.device), diagonal = 1
+                ).unsqueeze(0).unsqueeze(0)
+
+        # 最后拼接多头结果，放回
+        if attention_mask is not None:
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+            scores = scores + extended_attention_mask
+
+        scores = F.softmax(scores.float(), dim = -1).type_as(xq)
+        scores = self.attn_dropout(scores) 
+        output = scores@xv
+        # [bsz, self.n_local_heads, seq_len, self.head_dim]
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_key_value
