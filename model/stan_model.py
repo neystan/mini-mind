@@ -74,9 +74,11 @@ class StanMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from torch.nn import functional as F
 from .activation_fuctions import ACT2FN
+from transformers import GenerationMixin, PreTrainedModel
+from transformers.modelint_outputs import CausalLMOutputWithPast
 
 # 继承 nn.Module类
 class RMSNorm(nn.Module):
@@ -386,3 +388,59 @@ class StanMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states, presents
+
+class StanMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = StanMindConfig
+
+    def __init__(self, config : StanMindConfig):
+        self.config = config
+
+        super().__init__(config)
+
+        self.model = StanMindModel(config)
+
+        # 语言头
+        self.lm_head = nn.Linear(
+            self.config.hidden_size,
+            self.config.vocab_size,
+            bias = False
+        )
+
+        # 权重共享
+        # 输出层的权重 和 嵌入层的权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(
+            self,
+            input_ids : Optional[torch.Tensor] = None,
+            attention_mask : Optional[torch.Tensor] = None,
+            past_key_values : Optional[Tuple[tuple[torch.Tensor]]] = None,
+            use_cache : bool = False,
+            logits_to_keep : Union[int, torch.Tensor] = 0,
+            **args
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            past_key_values = past_key_values,
+            use_cache = use_cache,
+            **args
+        )
+
+        #logits to keep是整数，那就保留最后 n 个位置
+        # 生成时，只需要最后的logits来预测下一个token
+        slice_indices = (
+            slice(-logits_to_keep, None) 
+            if isinstance(logits_to_keep, int) 
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        # 输出
+        self.OUT.__setitem__("last_hidden_state", hidden_states)
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("past_key_values", past_key_values)
+
+        return self.OUT
