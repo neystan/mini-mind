@@ -76,9 +76,9 @@ import torch.nn as nn
 import math
 from typing import Optional, Tuple, Union
 from torch.nn import functional as F
-from .activation_fuctions import ACT2FN
+from transformers.activations import ACT2FN
 from transformers import GenerationMixin, PreTrainedModel
-from transformers.modelint_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # 继承 nn.Module类
 class RMSNorm(nn.Module):
@@ -90,14 +90,14 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 # _norm
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim = True) + self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim = True) + self.eps)
 # forward 
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x)
 
-def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Optional[dict] = None):
+def precompute_freqs_cis(dim : int, end : int = int(32 * 1024), rope_base : float = 1e6, rope_scaling : Optional[dict] = None):
     # 初始化rope频率
-    freqs, attn_factor = 1 / (rope_base ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)), 1.0
+    freqs, attn_factor = 1 / (rope_base ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim)), 1.0
 
     if rope_scaling is not None:
         orgin_max, factor, beta_fast, beta_slow = (
@@ -142,7 +142,7 @@ def precompute_freqs_cis(dim:int, end:int(32*1024), rope_base, rope_scaling:Opti
     return freqs_cos, freqs_sin
 
 # 编写RoPE的应用函数
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim = 1):
     # [a, b] -> [-b, a]
     def rotate_half(x):
         return torch.cat(
@@ -182,7 +182,6 @@ class Attention(nn.Module):
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
         self.n_local_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
         self.n_rep = self.n_local_heads // self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
@@ -204,7 +203,7 @@ class Attention(nn.Module):
 
     def forward(self, 
                 x : torch.Tensor, 
-                position_embedding : Tuple[torch.Tensor, torch.Tensor],
+                position_embeddings : Tuple[torch.Tensor, torch.Tensor],
                 past_key_value : Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
                 use_cache = False, 
                 attention_mask : Optional[torch.Tensor] = None,
@@ -219,7 +218,7 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
         # q k 使用 rope
-        cos, sim = position_embedding
+        cos, sim = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sim[:seq_len])
     
         # k v 使用 repeat， kv cache
@@ -302,10 +301,10 @@ class StanMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
         self.mlp = FeedForward(config)
 
-    def forward(self, hidden_states, position_embedding, past_key_value = None, use_cache = False, attention_mask = None):
+    def forward(self, hidden_states, position_embeddings, past_key_value = None, use_cache = False, attention_mask = None):
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states), position_embedding, past_key_value, use_cache, attention_mask
+            self.input_layernorm(hidden_states), position_embeddings, past_key_value, use_cache, attention_mask
         )
         # 残差处理
         hidden_states = residual + hidden_states
@@ -315,6 +314,7 @@ class StanMindBlock(nn.Module):
 class StanMindModel(nn.Module):
     def __init__(self, config : StanMindConfig):
         super().__init__()
+        self.config = config
         self.vocab_size, self.num_hidden_layers = (
             config.vocab_size,
             config.num_hidden_layers,
@@ -364,7 +364,7 @@ class StanMindModel(nn.Module):
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
         # 位置编码
-        position_embedding = (
+        position_embeddings = (
             self.freqs_cos[start_pos : start_pos + seq_len], 
             self.freqs_sin[start_pos : start_pos + seq_len]
             )
@@ -372,13 +372,13 @@ class StanMindModel(nn.Module):
         presents = []
 
         # 对每一层layer进行处理并追加，得到hidden_states和present_key_value
-        for layer_idx, (layer, past_key_values) in enumerate(
+        for layer_idx, (layer, past_key_value) in enumerate(
             zip(self.layers, past_key_values)
         ):
             hidden_states, present = layer(
                 hidden_states,
-                position_embedding,
-                past_key_value = past_key_values,
+                position_embeddings,
+                past_key_value = past_key_value,
                 use_cache = use_cache,
                 attention_mask = attention_mask,
             )
@@ -410,7 +410,6 @@ class StanMindForCausalLM(PreTrainedModel, GenerationMixin):
         # 输出层的权重 和 嵌入层的权重共享
         self.model.embed_tokens.weight = self.lm_head.weight
 
-        self.OUT = CausalLMOutputWithPast()
 
     def forward(
             self,
@@ -439,8 +438,8 @@ class StanMindForCausalLM(PreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         # 输出
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("logits", logits)
-        self.OUT.__setitem__("past_key_values", past_key_values)
-
-        return self.OUT
+        return CausalLMOutputWithPast(
+            logits = logits,
+            past_key_values = past_key_values,
+            hidden_states = hidden_states
+        )
