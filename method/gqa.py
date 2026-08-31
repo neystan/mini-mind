@@ -11,15 +11,15 @@ import torch.nn as nn
 
 
 # 进行线性变化， 就是对应用的张量 乘以 一个 w 矩阵 + b（这里的w、b都是随机的）
-# layer = nn.Linear(in_features = 3, out_features = 5, bias = True)
+layer = nn.Linear(in_features = 3, out_features = 5, bias = True)
 
-# t1 = torch.Tensor([1, 2, 3])
-# t2 = torch.Tensor([[1, 2, 3]])
+t1 = torch.Tensor([1, 2, 3])
+t2 = torch.Tensor([[1, 2, 3]])
 
-# output1 = layer(t1)
-# output2 = layer(t2)
-# print(output1)
-# print(output2)
+output1 = layer(t1)
+output2 = layer(t2)
+print(output1)
+print(output2)
 
 
 # # 改变张量的形状

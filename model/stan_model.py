@@ -155,7 +155,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     )
     return q_embed, k_embed
 
-
+# kv cache复用
 def repeat_kv(x : torch.Tensor, n_rep : int)-> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
@@ -184,7 +184,7 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
-        # 对线性层的 QKV进行一个定义
+        # 加入线性层 生成 Q K V
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias = False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias = False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias = False)
@@ -310,4 +310,79 @@ class StanMindBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
-    
+class StanMindModel(nn.Module):
+    def __init__(self, config : StanMindConfig):
+        super().__init__()
+        self.vocab_size, self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        self.dropout = nn.Dropout(config.dropout)
+
+        self.layer = nn.ModuleList(
+            [StanMindBlock(i, config) for i in range(self.num_hidden_layers)]
+        )
+
+        # RMSNorm归一化
+        self.norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+
+        # RoPE预计算
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim = config.hidden_size // config.num_attention_heads,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_theta,
+            rope_scaling = config.rope_scaling,
+        )
+
+        self.register_buffer("freqs_cos", freqs_cos, persistent = False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent = False)
+
+    def forward(
+            self,
+            input_ids : Optional[torch.Tensor] = None,
+            attention_mask : Optional[torch.Tensor] = None,
+            past_key_values : Optional[Tuple[tuple[torch.Tensor]]] = None,
+            use_cache : bool = False,
+            **kwargs,
+    ):
+        batch_size, seq_len = input_ids.shape
+
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
+
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        # 位置编码
+        position_embedding = (
+            self.freqs_cos[start_pos : start_pos + seq_len], 
+            self.freqs_sin[start_pos : start_pos + seq_len]
+            )
+
+        presents = []
+
+        # 对每一层layer进行处理并追加，得到hidden_states和present_key_value
+        for layer_idx, (layer, past_key_values) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embedding,
+                past_key_value = past_key_values,
+                use_cache = use_cache,
+                attention_mask = attention_mask,
+            )
+              
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states, presents
