@@ -109,7 +109,7 @@ def precompute_freqs_cis(dim : int, end : int = int(32 * 1024), rope_base : floa
 
     # 如果推断的长度 大于 训练长度，使用 YaRN 进行缩放
         if end > orgin_max:
-            # 波长b到i的映射
+            # 满足旋转 b圈 的维度索引
             inv_dim = lambda b : (dim * math.log(orgin_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
             # 划分高低维度
             # low 不需要缩放的 高频部分
@@ -131,11 +131,12 @@ def precompute_freqs_cis(dim : int, end : int = int(32 * 1024), rope_base : floa
             # ramp在0-1之间时：平滑过渡。
             freqs = freqs * (1 - ramp + ramp / factor)
 
-    #根据end，计算位置索引 t
-    t = torch.arange(end, device=freqs.device).float()
+    #根据end，计算token位置索引 t
+    t = torch.arange(0, end, device=freqs.device).float()
 
-    # 计算频率和位置的外积，得到每个位置的旋转角度
+    # 计算频率和位置的外积，得到每个token位置的旋转角度
     freqs = torch.outer(t, freqs).float()
+    # 获取角度的余弦和正弦值矩阵，并根据attn_factor进行缩放
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
 
@@ -143,12 +144,13 @@ def precompute_freqs_cis(dim : int, end : int = int(32 * 1024), rope_base : floa
 
 # 编写RoPE的应用函数
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim = 1):
-    # [a, b] -> [-b, a]
+    # [a, b] -> [-b, a],旋转90度的辅助函数
     def rotate_half(x):
         return torch.cat(
             (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
         )
-    #x_rotated=x*cos+rotate_ half(×)*sin   
+    # 得到包含位置信息的 Q K
+    # x_rotated=x*cos+ rotate_half(×)*sin   
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
         rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
     )
@@ -183,7 +185,7 @@ class Attention(nn.Module):
 
         self.n_local_heads = args.num_attention_heads
         self.n_rep = self.n_local_heads // self.num_key_value_heads
-        self.head_dim = args.hidden_size // args.num_attention_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads    # hidden_size 就是 特征向量的维度数
 
         # 加入线性层 生成 Q K V
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias = False)
@@ -204,7 +206,7 @@ class Attention(nn.Module):
     def forward(self, 
                 x : torch.Tensor, 
                 position_embeddings : Tuple[torch.Tensor, torch.Tensor],
-                past_key_value : Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+                past_key_value : Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # K和V的 缓存
                 use_cache = False, 
                 attention_mask : Optional[torch.Tensor] = None,
                 ) -> torch.Tensor:
@@ -228,8 +230,7 @@ class Attention(nn.Module):
         past_key_value = (xk, xv) if use_cache else None
 
         xq, xk, xv = (
-            xq.transpose(1, 2),
-            # [bsz, self.n_local_heads, seq_len, self.head_dim]
+            xq.transpose(1, 2),     # [bsz, self.n_local_heads, seq_len, self.head_dim]
             repeat_kv(xk, self.n_rep).transpose(1, 2), 
             repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
@@ -246,7 +247,8 @@ class Attention(nn.Module):
                                                     dropout_p = self.dropout if self.training else 0.0, is_causal = True)
         else:
             # 自定义实现
-            scores = (xq@xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # 加入因果掩码，确保每个位置只能关注到它之前的token
             scores = scores + torch.triu(
                 torch.full((seq_len,seq_len), float('-inf'), device = scores.device), diagonal = 1
                 ).unsqueeze(0).unsqueeze(0)
@@ -273,17 +275,18 @@ class FeedForward(nn.Module):
     # 激活函数
     # 降维
     # dropout
-    def __init__(self, args : StanMindConfig):
+    def __init__(self, config : StanMindConfig):
         super().__init__()
-        if args.intermediate_size is None:
-            intermediate_size = int(args.hidden_size * 8 / 3)
-            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        if config.intermediate_size is None:
+            # 升维大小
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
 
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias = False)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias = False)
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias = False)
-        self.dropout = nn.Dropout(args.dropout)
-        self.act_fn = ACT2FN[args.hidden_act]
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias = False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias = False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias = False)
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x): 
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
