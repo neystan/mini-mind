@@ -5,6 +5,10 @@ build/
 dist/
 wheels/
 *.egg-info
+checkpoints/
+out/
+*.json 
+*.jsonl
 
 # Virtual environments
 .venv
