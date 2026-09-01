@@ -108,28 +108,28 @@ def precompute_freqs_cis(dim : int, end : int = int(32 * 1024), rope_base : floa
         )
 
     # 如果推断的长度 大于 训练长度，使用 YaRN 进行缩放
-    if end > orgin_max:
-        # 波长b到i的映射
-        inv_dim = lambda b : (dim * math.log(orgin_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
-        # 划分高低维度
-        # low 不需要缩放的 高频部分
-        # high 需要缩放的 低频部分
-        low ,high = max(math.floor(inv_dim(beta_fast)), 0) , min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+        if end > orgin_max:
+            # 波长b到i的映射
+            inv_dim = lambda b : (dim * math.log(orgin_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            # 划分高低维度
+            # low 不需要缩放的 高频部分
+            # high 需要缩放的 低频部分
+            low ,high = max(math.floor(inv_dim(beta_fast)), 0) , min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
 
-        # 计算缩放因子
-        # low部分 ramp = 0, high部分 ramp = 1， low与high之间平滑过渡
-        ramp = torch.clamp(
-            (torch.arange(dim // 2, device=freqs.device).float() - low)
-            / max(high - low, 0.001),
-            0,
-            1,
-        )
+            # 计算缩放因子
+            # low部分 ramp = 0, high部分 ramp = 1， low与high之间平滑过渡
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                / max(high - low, 0.001),
+                0,
+                1,
+            )
 
-        # 频率融合公式：f'(i) = f(i) * ((1-γ) + γ/s)
-        # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
-        # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
-        # ramp在0-1之间时：平滑过渡。
-        freqs = freqs * (1 - ramp + ramp / factor)
+            # 频率融合公式：f'(i) = f(i) * ((1-γ) + γ/s)
+            # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
+            # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
+            # ramp在0-1之间时：平滑过渡。
+            freqs = freqs * (1 - ramp + ramp / factor)
 
     #根据end，计算位置索引 t
     t = torch.arange(end, device=freqs.device).float()
@@ -251,15 +251,15 @@ class Attention(nn.Module):
                 torch.full((seq_len,seq_len), float('-inf'), device = scores.device), diagonal = 1
                 ).unsqueeze(0).unsqueeze(0)
 
-        # 最后拼接多头结果，放回
-        if attention_mask is not None:
-            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-            scores = scores + extended_attention_mask
+            # 最后拼接多头结果，放回
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
 
-        scores = F.softmax(scores.float(), dim = -1).type_as(xq)
-        scores = self.attn_dropout(scores) 
-        output = scores@xv
+            scores = F.softmax(scores.float(), dim = -1).type_as(xq)
+            scores = self.attn_dropout(scores) 
+            output = scores@xv
         # [bsz, self.n_local_heads, seq_len, self.head_dim]
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
@@ -324,7 +324,7 @@ class StanMindModel(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-        self.layer = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [StanMindBlock(i, config) for i in range(self.num_hidden_layers)]
         )
 
@@ -418,6 +418,7 @@ class StanMindForCausalLM(PreTrainedModel, GenerationMixin):
             past_key_values : Optional[Tuple[tuple[torch.Tensor]]] = None,
             use_cache : bool = False,
             logits_to_keep : Union[int, torch.Tensor] = 0,
+            labels: Optional[torch.Tensor] = None,
             **args
     ):
         hidden_states, past_key_values = self.model(
@@ -437,8 +438,19 @@ class StanMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
         # 输出
         return CausalLMOutputWithPast(
+            loss=loss,
             logits = logits,
             past_key_values = past_key_values,
             hidden_states = hidden_states
